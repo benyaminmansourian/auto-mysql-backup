@@ -218,12 +218,18 @@ upload_sftp_multi() {
 # ==========================================================
 # Upload Handling
 # ==========================================================
-upload_ftp_multi
-upload_ftps_multi
-upload_sftp_multi
+if [ "$UPLOAD_ENABLED" = "true" ]; then
+  log "📤 Remote upload enabled — starting upload to destinations..."
 
-if [ "${#FTP_DESTINATIONS[@]}" -eq 0 ] && [ "${#FTPS_DESTINATIONS[@]}" -eq 0 ] && [ "${#SFTP_DESTINATIONS[@]}" -eq 0 ]; then
-  log "🚫 No upload destinations configured"
+  upload_ftp_multi
+  upload_ftps_multi
+  upload_sftp_multi
+
+  if [ "${#FTP_DESTINATIONS[@]}" -eq 0 ] && [ "${#FTPS_DESTINATIONS[@]}" -eq 0 ] && [ "${#SFTP_DESTINATIONS[@]}" -eq 0 ]; then
+    log "🚫 No upload destinations configured"
+  fi
+else
+  log "🚫 Remote upload disabled via .env (UPLOAD_ENABLED=false)"
 fi
 
 # ==========================================================
