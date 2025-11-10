@@ -79,8 +79,8 @@ cd auto-mysql-backup
 sudo mv mysql_backup.env /etc/
 
 # 3) Install the backup script globally so it can be run from anywhere
-chmod 755 mysql_backup.sh
-sudo mv mysql_backup.sh /usr/local/bin/mysql_backup
+chmod 755 mysql_backup
+sudo mv mysql_backup /usr/local/bin/
 
 # 4) Cleanup - remove the cloned repository
 cd ..
