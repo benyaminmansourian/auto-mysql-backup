@@ -170,11 +170,11 @@ The script sends start and completion summaries and can also attach the log file
 ## Log file & permissions
 The script automatically writes logs to:
 ```
-$BACKUP_BASE_DIR/backup.log
+$BACKUP_BASE_DIR/$DATE/backup_${DATE}.log
 ```
 Example default path (from `.env`):
 ```
-/backup/dbbackup/backup.log
+/backup/dbbackup/2025-11-12/backup_2025-11-12.log
 ```
 ### Log structure
 - Backup start and end timestamps
@@ -195,7 +195,7 @@ This limits read/write access to root only, improving data security.
 ## Operational notes & hardening
 - Backup directory must be writable.
 - Prefer SFTP/FTPS for encrypted transfers.
-- Consider log rotation for `backup.log`.
+- Consider log rotation for `backup_${DATE}.log`.
 - Limit access to the `.env` file strictly with `chmod 600`.
 - Restrict log access using `chmod 600` as shown above.
 
