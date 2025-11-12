@@ -274,4 +274,5 @@ fi
 # --- Finalization ---
 wait
 log "=== Backup script finished ==="
+sudo chmod 600 $LOG_FILE
 exit 0
