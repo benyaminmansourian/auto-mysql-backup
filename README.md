@@ -185,8 +185,8 @@ Example default path (from `.env`):
 ### Restrict log access
 Because the log may contain sensitive paths or errors:
 ```bash
-sudo chown root:root /backup/dbbackup/backup.log
-sudo chmod 600 /backup/dbbackup/backup.log
+sudo chown root:root /backup/dbbackup/$(date +%Y-%m-%d)/backup_$(date +%Y-%m-%d).log
+sudo chmod 600 /backup/dbbackup/$(date +%Y-%m-%d)/backup_$(date +%Y-%m-%d).log
 ```
 This limits read/write access to root only, improving data security.
 
