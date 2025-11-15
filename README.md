@@ -4,7 +4,7 @@ Reliable MySQL backup automation with multi-destination uploads (FTP / FTPS / SF
 ## Table of Contents
 - [What this script does](#what-this-script-does)
 - [Features](#features)
-- [How it works (at a glance)](#how-it-works-at-a-glance)
+- [How it works](#how-it-works)
 - [Prerequisites](#prerequisites)
   - [Debian / Ubuntu](#debian--ubuntu)
   - [RHEL / CentOS / Rocky / AlmaLinux](#rhel--centos--rocky--almalinux)
@@ -39,7 +39,7 @@ Reliable MySQL backup automation with multi-destination uploads (FTP / FTPS / SF
 - **Auto cleanup** of old backups
 - **Verbose logging** to `backup.log`
 
-## How it works (at a glance)
+## How it works
 1. Reads configuration from an external `.env` file.
 2. Enumerates MySQL databases (excludes `mysql`, `sys`, etc.).
 3. Dumps each DB → `mysqldump | gzip` → `YYYY-MM-DD/dbname.sql.gz`.
