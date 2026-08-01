@@ -1,20 +1,66 @@
 #!/bin/bash
 # ==========================================================
-# MySQL Backup Script
+# MySQL Backup Script v3
 # ==========================================================
 # Author: Benyamin Mansourian
 # GitHub: https://github.com/benyaminmansourian
 # License: MIT License
 # ==========================================================
-# Features:
-# - Configurable via .env file
-# - Gzip + optional AES256 GPG encryption
-# - Multi-destination FTP / FTPS / SFTP uploads with retry logic
-# - Telegram notifications + log upload
-# - Full logging with error tracking
-# ==========================================================
+
+set -o pipefail
+shopt -s nullglob
 
 ENV_FILE="/etc/mysql_backup.env"
+LOCK_FILE="/var/lock/mysql_backup.lock"
+ONLY_DB=""
+OLD_DIRS=()
+
+usage() {
+  cat <<EOF
+Usage: mysql_backup [OPTIONS]
+
+Reliable MySQL backup automation with multi-destination uploads (FTP / FTPS / SFTP),
+AES-256 GPG encryption, and Telegram notifications.
+
+Options:
+  --only-db=DBNAME      Backup only the specified database instead of all databases.
+                       Useful for quick debugging or testing a single database.
+  -h, --help          Show this help message and exit.
+
+Config:
+  Reads settings from: ${ENV_FILE}
+  (backup dir, MySQL credentials, retention days, encryption, upload
+   destinations, Telegram bot token/chat IDs, Telegram proxy, etc.)
+
+Examples:
+  mysql_backup                       # backup all databases as configured
+  mysql_backup --only-db=myapp_prod  # backup only "myapp_prod"
+
+Log file location:
+  \$BACKUP_BASE_DIR/YYYY-MM-DD/backup_YYYY-MM-DD.log
+
+Project: https://github.com/benyaminmansourian/auto-mysql-backup
+License: MIT
+EOF
+}
+
+for arg in "$@"; do
+  case $arg in
+    --only-db=*)
+      ONLY_DB="${arg#*=}"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "❌ Unknown option: $arg"
+      echo ""
+      usage
+      exit 1
+      ;;
+  esac
+done
 
 if [ ! -f "$ENV_FILE" ]; then
   echo "❌ Config file not found at $ENV_FILE"
@@ -23,8 +69,15 @@ fi
 
 source "$ENV_FILE"
 
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+  echo "⚠️ Another instance of mysql_backup is already running. Exiting."
+  exit 1
+fi
+
 START_TIME=$(date +%s)
 DATE=$(date +%Y-%m-%d)
+DATETIME_DISPLAY=$(date '+%Y-%m-%d %H:%M')
 BACKUP_DIR="$BACKUP_BASE_DIR/$DATE"
 LOG_FILE="$BACKUP_DIR/backup_${DATE}.log"
 
@@ -39,65 +92,79 @@ log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
 }
 
-send_telegram_message() {
-  if [ "$TELEGRAM_ENABLED" = "true" ]; then
-    local MESSAGE="$1"
-    MESSAGE=$(echo -e "$MESSAGE")
-
-    if [ ${#TELEGRAM_CHAT_IDS[@]} -gt 0 ]; then
-      for CHAT_ID in "${TELEGRAM_CHAT_IDS[@]}"; do
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-          -d chat_id="$CHAT_ID" \
-          -d parse_mode="HTML" \
-          --data-urlencode "text=$MESSAGE" >/dev/null 2>&1
-      done
-    elif [ -n "$TELEGRAM_CHAT_ID" ]; then
-      curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d chat_id="$TELEGRAM_CHAT_ID" \
-        -d parse_mode="HTML" \
-        --data-urlencode "text=$MESSAGE" >/dev/null 2>&1
+TG_PROXY_ARGS=()
+build_telegram_proxy_args() {
+  TG_PROXY_ARGS=()
+  if [ "$TELEGRAM_PROXY_ENABLED" = "true" ] && [ -n "$TELEGRAM_PROXY_ADDR" ]; then
+    local scheme="${TELEGRAM_PROXY_TYPE:-socks5h}"
+    [ "$scheme" = "socks5" ] && scheme="socks5h"
+    TG_PROXY_ARGS+=(--proxy "${scheme}://${TELEGRAM_PROXY_ADDR}")
+    if [ -n "$TELEGRAM_PROXY_USER" ]; then
+      TG_PROXY_ARGS+=(--proxy-user "${TELEGRAM_PROXY_USER}:${TELEGRAM_PROXY_PASS}")
     fi
+  fi
+}
+build_telegram_proxy_args
+
+send_telegram_message() {
+  [ "$TELEGRAM_ENABLED" = "true" ] || return 0
+  local MESSAGE
+  MESSAGE=$(echo -e "$1")
+
+  if [ ${#TELEGRAM_CHAT_IDS[@]} -gt 0 ]; then
+    for CHAT_ID in "${TELEGRAM_CHAT_IDS[@]}"; do
+      curl -s "${TG_PROXY_ARGS[@]}" -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -d chat_id="$CHAT_ID" -d parse_mode="HTML" \
+        --data-urlencode "text=$MESSAGE" >/dev/null 2>&1
+    done
+  elif [ -n "$TELEGRAM_CHAT_ID" ]; then
+    curl -s "${TG_PROXY_ARGS[@]}" -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      -d chat_id="$TELEGRAM_CHAT_ID" -d parse_mode="HTML" \
+      --data-urlencode "text=$MESSAGE" >/dev/null 2>&1
   fi
 }
 
 send_telegram_file() {
-  if [ "$TELEGRAM_ENABLED" = "true" ]; then
-    local CAPTION="$1"
-    CAPTION=$(echo -e "$CAPTION")
+  [ "$TELEGRAM_ENABLED" = "true" ] || return 0
+  [ -f "$LOG_FILE" ] || return 0
+  local CAPTION
+  CAPTION=$(echo -e "$1")
 
-    if [ -f "$LOG_FILE" ]; then
-      if [ ${#TELEGRAM_CHAT_IDS[@]} -gt 0 ]; then
-        for CHAT_ID in "${TELEGRAM_CHAT_IDS[@]}"; do
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-            -F chat_id="$CHAT_ID" \
-            -F document=@"$LOG_FILE" \
-            -F parse_mode="HTML" \
-            --form-string "caption=$CAPTION" >/dev/null 2>&1
-        done
-      elif [ -n "$TELEGRAM_CHAT_ID" ]; then
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-          -F chat_id="$TELEGRAM_CHAT_ID" \
-          -F document=@"$LOG_FILE" \
-          -F parse_mode="HTML" \
-          --form-string "caption=$CAPTION" >/dev/null 2>&1
-      fi
-    fi
+  if [ ${#TELEGRAM_CHAT_IDS[@]} -gt 0 ]; then
+    for CHAT_ID in "${TELEGRAM_CHAT_IDS[@]}"; do
+      curl -s "${TG_PROXY_ARGS[@]}" -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+        -F chat_id="$CHAT_ID" -F document=@"$LOG_FILE" -F parse_mode="HTML" \
+        --form-string "caption=$CAPTION" >/dev/null 2>&1
+    done
+  elif [ -n "$TELEGRAM_CHAT_ID" ]; then
+    curl -s "${TG_PROXY_ARGS[@]}" -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+      -F chat_id="$TELEGRAM_CHAT_ID" -F document=@"$LOG_FILE" -F parse_mode="HTML" \
+      --form-string "caption=$CAPTION" >/dev/null 2>&1
   fi
 }
 
-# ==========================================================
-# Backup
-# ==========================================================
 log "=== Starting MySQL backup ==="
-send_telegram_message "📦 <b>MySQL Backup Started</b>\n🖥️ Host: $(hostname)\n📅 Date: $DATE"
+[ -n "$ONLY_DB" ] && log "🎯 Running in single-db mode: $ONLY_DB"
+send_telegram_message "📦 <b>MySQL Backup Started</b>\n🖥️ Host: $(hostname)\n📅 Date: $DATETIME_DISPLAY"
 
 if [ "$USE_PASSWORD" = "true" ]; then
-  AUTH_ARGS="-u$MYSQL_USER -p$MYSQL_PASSWORD"
+  AUTH_ARGS=(-u"$MYSQL_USER" -p"$MYSQL_PASSWORD")
 else
-  AUTH_ARGS="-u$MYSQL_USER"
+  AUTH_ARGS=(-u"$MYSQL_USER")
 fi
 
-databases=$($MYSQL $AUTH_ARGS -e "SHOW DATABASES;" | grep -Ev "(Database|information_schema|performance_schema|mysql|sys)")
+if ! "$MYSQL" "${AUTH_ARGS[@]}" -e "SELECT 1;" >/dev/null 2>&1; then
+  log "❌ Cannot connect to MySQL server. Check credentials/socket. Aborting."
+  send_telegram_message "🚨 <b>MySQL Backup Aborted</b>\n🖥️ Host: $(hostname)\nReason: cannot connect to MySQL"
+  wait
+  exit 1
+fi
+
+if [ -n "$ONLY_DB" ]; then
+  databases="$ONLY_DB"
+else
+  databases=$("$MYSQL" "${AUTH_ARGS[@]}" -e "SHOW DATABASES;" | grep -Ev "(Database|information_schema|performance_schema|mysql|sys)")
+fi
 
 ERROR_COUNT=0
 ERROR_LOG=""
@@ -105,34 +172,42 @@ ERROR_LOG=""
 for db in $databases; do
   log "Backing up: $db"
   ERROR_OUTPUT=$(mktemp)
-  $MYSQLDUMP $AUTH_ARGS --force --opt --databases "$db" 2> "$ERROR_OUTPUT" | gzip > "$BACKUP_DIR/$db.sql.gz"
-  EXIT_CODE=$?
+  OUT_FILE="$BACKUP_DIR/$db.sql.gz"
 
-  if [ $EXIT_CODE -eq 0 ]; then
-    log "✅ Backup success for $db"
-  else
-    log "❌ Backup failed for $db (exit code: $EXIT_CODE)"
+  "$MYSQLDUMP" "${AUTH_ARGS[@]}" --force --opt --databases "$db" 2> "$ERROR_OUTPUT" | gzip > "$OUT_FILE"
+  EXIT_CODE=${PIPESTATUS[0]}
+
+  if [ "$EXIT_CODE" -ne 0 ]; then
+    log "❌ Backup failed for $db (mysqldump exit code: $EXIT_CODE)"
     ERROR_COUNT=$((ERROR_COUNT + 1))
-    ERR_TEXT=$(cat "$ERROR_OUTPUT" | tail -n 5)
+    ERR_TEXT=$(tail -n 5 "$ERROR_OUTPUT")
     ERROR_LOG+="❌ <b>$db</b> → ${ERR_TEXT}\n"
+    rm -f "$OUT_FILE"
+  else
+    if gzip -t "$OUT_FILE" 2>/dev/null; then
+      log "✅ Backup success for $db ($(du -h "$OUT_FILE" | cut -f1))"
+    else
+      log "❌ Integrity check failed for $db.sql.gz (corrupt archive)"
+      ERROR_COUNT=$((ERROR_COUNT + 1))
+      ERROR_LOG+="❌ <b>$db</b> → corrupt archive after gzip -t\n"
+      rm -f "$OUT_FILE"
+    fi
   fi
 
   rm -f "$ERROR_OUTPUT"
 done
 
-# ==========================================================
-# Optional Encryption
-# ==========================================================
 encrypt_backups() {
   log "Encrypting backups using AES-256 GPG encryption..."
   for file in "$BACKUP_DIR"/*.gz; do
-    echo "$GPG_PASSWORD" | gpg --batch --yes --passphrase-fd 0 \
-      --symmetric --cipher-algo AES256 "$file"
-    if [ $? -eq 0 ]; then
+    if echo "$GPG_PASSWORD" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+      --symmetric --cipher-algo AES256 "$file"; then
       log "✅ Encrypted: $(basename "$file")"
       rm -f "$file"
     else
       log "❌ Encryption failed for $(basename "$file")"
+      ERROR_COUNT=$((ERROR_COUNT + 1))
+      ERROR_LOG+="❌ <b>$(basename "$file")</b> → encryption failed, plaintext kept\n"
     fi
   done
 }
@@ -143,28 +218,82 @@ else
   log "Encryption disabled"
 fi
 
-# ==========================================================
-# Cleanup
-# ==========================================================
-log "Deleting backups older than $RETENTION_DAYS days..."
-find "$BACKUP_BASE_DIR" -type d -mtime +$RETENTION_DAYS -exec rm -rf {} \; 2>/dev/null
+cleanup_local() {
+  log "Deleting local backups older than $RETENTION_DAYS days (by folder name)..."
+  local cutoff dname dir
+  cutoff=$(date -d "-$RETENTION_DAYS days" +%Y-%m-%d)
+
+  for dir in "$BACKUP_BASE_DIR"/*/; do
+    dname=$(basename "$dir")
+    if [[ "$dname" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [[ "$dname" < "$cutoff" ]]; then
+      OLD_DIRS+=("$dname")
+      rm -rf "$dir"
+      log "🗑️ Removed local dir: $dname"
+    fi
+  done
+}
+
+cleanup_remote_ftp_family() {
+  local -n destinations=$1
+  local scheme=$2
+  local dest host user pass path old_dir
+
+  [ "${#destinations[@]}" -eq 0 ] && return
+  [ "${#OLD_DIRS[@]}" -eq 0 ] && return
+  if ! command -v lftp >/dev/null 2>&1; then
+    log "⚠️ lftp not installed, skipping remote $scheme cleanup"
+    return
+  fi
+
+  for dest in "${destinations[@]}"; do
+    IFS='|' read -r host user pass path <<< "$dest"
+    for old_dir in "${OLD_DIRS[@]}"; do
+      if lftp -u "$user,$pass" "${scheme}://$host" -e "rm -rf $path/$old_dir; bye" >/dev/null 2>&1; then
+        log "🗑️ Removed remote ($scheme) $host:$path/$old_dir"
+      else
+        log "⚠️ Could not remove remote ($scheme) $host:$path/$old_dir (may not exist)"
+      fi
+    done
+  done
+}
+
+cleanup_remote_sftp() {
+  local dest host user pass path old_dir
+
+  [ "${#SFTP_DESTINATIONS[@]}" -eq 0 ] && return
+  [ "${#OLD_DIRS[@]}" -eq 0 ] && return
+
+  for dest in "${SFTP_DESTINATIONS[@]}"; do
+    IFS='|' read -r host user pass path <<< "$dest"
+    for old_dir in "${OLD_DIRS[@]}"; do
+      if sshpass -p "$pass" ssh -o StrictHostKeyChecking=no "$user@$host" "rm -rf '$path/$old_dir'" >/dev/null 2>&1; then
+        log "🗑️ Removed remote (SFTP) $host:$path/$old_dir"
+      else
+        log "⚠️ Could not remove remote (SFTP) $host:$path/$old_dir (may not exist)"
+      fi
+    done
+  done
+}
+
+cleanup_local
+
+if [ "$UPLOAD_ENABLED" = "true" ]; then
+  cleanup_remote_ftp_family FTP_DESTINATIONS ftp
+  cleanup_remote_ftp_family FTPS_DESTINATIONS ftps
+  cleanup_remote_sftp
+fi
+
 log "Cleanup complete."
 
-# ==========================================================
-# Helper function for retry logic
-# ==========================================================
 retry_upload() {
-  local cmd="$1"
-  local host="$2"
-  local file="$3"
-  local type="$4"
-  local attempt=1
-  local success=false
+  local host="$1" file="$2" type="$3"
+  shift 3
+  local -a cmd_args=("$@")
+  local attempt=1 success=false
 
   while [ $attempt -le 3 ]; do
     log "→ Attempt $attempt for $type upload ($host): $(basename "$file")"
-    eval "$cmd"
-    if [ $? -eq 0 ]; then
+    if "${cmd_args[@]}"; then
       log "✅ $type upload succeeded on attempt $attempt ($host)"
       success=true
       break
@@ -181,48 +310,48 @@ retry_upload() {
   fi
 }
 
-# ==========================================================
-# Upload functions (multi-destination with retry)
-# ==========================================================
 upload_ftp_multi() {
-  if [ "${#FTP_DESTINATIONS[@]}" -eq 0 ]; then return; fi
+  [ "${#FTP_DESTINATIONS[@]}" -eq 0 ] && return
   log "Uploading to FTP destinations..."
+  local dest host user pass path file
   for dest in "${FTP_DESTINATIONS[@]}"; do
     IFS='|' read -r host user pass path <<< "$dest"
     for file in "$BACKUP_DIR"/*; do
-      cmd="curl -T \"$file\" \"ftp://$user:$pass@$host/$path/$DATE/\" --ftp-create-dirs --silent"
-      retry_upload "$cmd" "$host" "$file" "FTP"
+      [[ "$file" == *.log ]] && continue
+      retry_upload "$host" "$file" "FTP" \
+        curl -s -T "$file" --user "$user:$pass" "ftp://$host/$path/$DATE/" --ftp-create-dirs
     done
   done
 }
 
 upload_ftps_multi() {
-  if [ "${#FTPS_DESTINATIONS[@]}" -eq 0 ]; then return; fi
+  [ "${#FTPS_DESTINATIONS[@]}" -eq 0 ] && return
   log "Uploading to FTPS destinations..."
+  local dest host user pass path file
   for dest in "${FTPS_DESTINATIONS[@]}"; do
     IFS='|' read -r host user pass path <<< "$dest"
     for file in "$BACKUP_DIR"/*; do
-      cmd="curl -T \"$file\" \"ftps://$user:$pass@$host/$path/$DATE/\" --ftp-create-dirs --silent --ssl"
-      retry_upload "$cmd" "$host" "$file" "FTPS"
+      [[ "$file" == *.log ]] && continue
+      retry_upload "$host" "$file" "FTPS" \
+        curl -s -T "$file" --user "$user:$pass" "ftps://$host/$path/$DATE/" --ftp-create-dirs --ssl
     done
   done
 }
 
 upload_sftp_multi() {
-  if [ "${#SFTP_DESTINATIONS[@]}" -eq 0 ]; then return; fi
+  [ "${#SFTP_DESTINATIONS[@]}" -eq 0 ] && return
   log "Uploading to SFTP destinations..."
+  local dest host user pass path file
   for dest in "${SFTP_DESTINATIONS[@]}"; do
     IFS='|' read -r host user pass path <<< "$dest"
     for file in "$BACKUP_DIR"/*; do
-      cmd="sshpass -p \"$pass\" scp -q \"$file\" \"$user@$host:$path/$DATE/\""
-      retry_upload "$cmd" "$host" "$file" "SFTP"
+      [[ "$file" == *.log ]] && continue
+      retry_upload "$host" "$file" "SFTP" \
+        sshpass -p "$pass" scp -q -o StrictHostKeyChecking=no "$file" "$user@$host:$path/$DATE/"
     done
   done
 }
 
-# ==========================================================
-# Upload Handling
-# ==========================================================
 if [ "$UPLOAD_ENABLED" = "true" ]; then
   upload_ftp_multi
   upload_ftps_multi
@@ -235,23 +364,21 @@ else
   log "🚫 Upload disabled (local backup only)"
 fi
 
-# ==========================================================
-# Completion
-# ==========================================================
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 MINUTES=$((DURATION / 60))
 SECONDS=$((DURATION % 60))
+BACKUP_SIZE=$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)
+END_DATETIME_DISPLAY=$(date '+%Y-%m-%d %H:%M')
 
 if [ $ERROR_COUNT -gt 0 ]; then
-  SUMMARY="⚠️ <b>Backup completed with ${ERROR_COUNT} error(s)</b>\n🕒 Duration: ${MINUTES}m ${SECONDS}s\n📅 Date: $DATE\n\n$ERROR_LOG"
+  SUMMARY="⚠️ <b>Backup completed with ${ERROR_COUNT} error(s)</b>\n🕒 Duration: ${MINUTES}m ${SECONDS}s\n📦 Size: ${BACKUP_SIZE}\n📅 Date: $END_DATETIME_DISPLAY\n\n$ERROR_LOG"
   log "⚠️ Backup completed with ${ERROR_COUNT} errors."
 else
-  SUMMARY="✅ <b>MySQL Backup Completed Successfully</b>\n🕒 Duration: ${MINUTES}m ${SECONDS}s\n📅 Date: $DATE"
-  log "✅ MySQL backup process completed successfully in ${MINUTES}m ${SECONDS}s"
+  SUMMARY="✅ <b>MySQL Backup Completed Successfully</b>\n🕒 Duration: ${MINUTES}m ${SECONDS}s\n📦 Size: ${BACKUP_SIZE}\n📅 Date: $END_DATETIME_DISPLAY"
+  log "✅ MySQL backup process completed successfully in ${MINUTES}m ${SECONDS}s (size: ${BACKUP_SIZE})"
 fi
 
-# add failed upload info if exists
 if [ ${#FAILED_TARGETS[@]} -gt 0 ]; then
   FAIL_MSG="\n\n🚨 <b>Failed Upload Destinations:</b>\n"
   for target in "${FAILED_TARGETS[@]}"; do
@@ -263,16 +390,12 @@ else
   FINAL_MESSAGE="$SUMMARY"
 fi
 
-# --- Telegram Notifications (optional & async) ---
 if [ "$TELEGRAM_ENABLED" = "true" ]; then
   send_telegram_message "$FINAL_MESSAGE" &
   send_telegram_file "📄 Backup log file for $(hostname) ($DATE)" &
-else
-  log "📵 Telegram notifications disabled"
 fi
 
-# --- Finalization ---
 wait
 log "=== Backup script finished ==="
-sudo chmod 600 $LOG_FILE
+chmod 600 "$LOG_FILE"
 exit 0
